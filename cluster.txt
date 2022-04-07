@@ -1,0 +1,155 @@
+## SETUP
+
+0. Cluster has been set on GCP. Used 3 `e2-standard-2` machines. Use the provided SSH key to access the VM's.
+```
+NAME    STATUS   ROLES    AGE   VERSION
+node1   Ready    master   43h   v1.18.10
+node2   Ready    master   43h   v1.18.10
+node3   Ready    master   43h   v1.18.10
+```
+
+1. Followed the https://nightlies.apache.org/flink/flink-docs-master/docs/deployment/resource-providers/standalone/kubernetes/ , and created the 5 `.yaml` files jobmanager-service.yaml taskmanager-session-deployment.yaml flink-configuration-configmap.yaml jobmanager-rest-service.yaml jobmanager-session-deployment.yaml
+
+```
+Replace `log4j-console.properties` with `log4j-cli.properties` on the flink-configuration-configmap.yaml, jobmanager-session-deployment.yaml, taskmanager-session-deployment.yaml files since we are goinf to run the jubs with `flink run`
+Used `flink:1.7.2-hadoop28-scala_2.11` image -via Docker Hub- on the jobmanager-session-deployment.yaml, taskmanager-session-deployment.yaml files to use a job with HDFS. With the newer versions of the Flink, Hadoop does not work reliably, and to possibly mitigate the issue, one should probably build a custom Docker image, with Hadoop preinstalled.
+Since the homework does not state any version requirements, we went along with this image.
+Increased the taskmanager replica count to 5 since the default setup with 2 replicas wasn't providing enough slots for Flink to run most of the example Java code (WordCount.jar can be used as an example). (I observed the minimum number of slots required was 5, and increasing the slots per TM would immediately crash the TM pods.)
+```
+
+2. SSH into one of Kubernetes node and create folders for Flink resources
+
+```
+ssh -i id_rsa username@MACHINE_IP
+mkdir -p flink
+mkdir -p flink/job
+cd flink
+```
+
+3. Copy the created Flink resource files to that Kubernetes node via SCP (from local)
+
+```
+# Copy
+scp -i id_rsa taskmanager-session-deployment.yaml flink-configuration-configmap.yaml jobmanager-service.yaml  jobmanager-session-deployment.yaml jobmanager-rest-service.yaml username@MACHINE_IP:/home/username/flink/
+```
+
+4. SSH to remote Kubernetes node and switch to root user:
+
+```
+ssh -i id_rsa username@MACHINE_IP
+sudo -i
+# Path where the Kubernetes yml resource files are located for deployment
+cd /home/username/flink
+```
+
+5. Deploy the Flink Kubernetes resources using the resources created in Step 1.
+
+```
+# Configuration and service definition (switch the root since kubectl won't be able to detect nodes)
+$ kubectl create -f flink-configuration-configmap.yaml
+$ kubectl create -f jobmanager-service.yaml
+
+# Create the deployments for the cluster
+$ kubectl create -f jobmanager-session-deployment.yaml
+$ kubectl create -f taskmanager-session-deployment.yaml
+```
+
+5-a.(OPTIONAL) Set up port forward to access the Flink UI and submit jobs if required
+
+```
+# Makes the Flink Web UI accessible on the node using localhost
+kubectl port-forward ENTER_FLINK_JM_POD 8081:8081
+```
+
+5-b.(OPTIONAL) Set up a nodePort service to access the Web UI of Flink
+
+```
+kubectl create -f jobmanager-rest-service.yaml
+```
+
+
+8. Copy Job program to the Kubernetes node (from local)
+
+```
+scp -i id_rsa WordCount.jar username@MACHINE_IP:~/flink/
+```
+
+9. Install Helm for Hadoop (https://gist.github.com/TeemuKoivisto/5632fabee4915dc63055e8e544247f60) (On Node) (root)
+
+```
+mkdir -p hadoop
+cd hadoop
+# Download the Helm package
+wget https://get.helm.sh/helm-v3.7.2-linux-amd64.tar.gz
+tar xf helm-v3.7.2-linux-amd64.tar.gz
+mv linux-amd64/helm /usr/local/bin/helm
+```
+
+10. Add stable Helm chart repo to fetch Hadoop files (https://gist.github.com/TeemuKoivisto/5632fabee4915dc63055e8e544247f60)
+
+```
+helm repo add stable https://charts.helm.sh/stable
+```
+
+11. Install Hadoop through Helm (https://gist.github.com/TeemuKoivisto/5632fabee4915dc63055e8e544247f60)
+
+```
+# Installs Hadoop through Helm on the Kubernetes Cluster using the stable/hadoop helm chart and overriding default values (We found using these values makes the TM pods more "stable" for some reason (Probably because of the GCP VM specs), the GIST linked above have some more additional info)
+helm install --set yarn.nodeManager.resources.limits.memory=4096Mi --set yarn.nodeManager.replicas=1 --set yarn.nodeManager.resources.requests.memory="1024Mi" --set yarn.nodeManager.resources.requests.cpu="500m" hadoop stable/hadoop
+```
+
+12. Prepare HDFS with input and output folder
+
+```
+# Get get pod name of the Hadoop node manager (nm)
+H_POD_NAME=$(kubectl get pods | grep yarn-nm | awk '{print $1}')
+
+# Create the input folder on the Hadoop node manager pod
+kubectl exec -it "$H_POD_NAME" -- bash -c "mkdir -p /home/input"
+
+# Copy the input data to the /home/input folder on the Hadoop node manager pod so that it can be loaded from there to HDFS afterwards
+kubectl cp tolstoy-war-and-peace.txt "${H_POD_NAME}":/home/input/
+
+# Connect inside the Hadoop pod using bash to execute the commands afterwards
+kubectl exec -it "$H_POD_NAME" bash
+
+# Create the input and output folders on the HDFS drive (to be executed on the Hadoop pod $H_POD_NAME)
+/usr/local/hadoop/bin/hadoop fs -mkdir /input
+/usr/local/hadoop/bin/hadoop fs -mkdir /output
+
+# Adjust permission/owner on HDFS for the Flink user (to be executed on the Hadoop pod $H_POD_NAME)
+/usr/local/hadoop/bin/hadoop fs -chown flink /output
+
+# Load the input data (tolstoy-war-and-peace.txt) to the input path on the HDFS drive (to be executed on the Hadoop pod $H_POD_NAME)
+/usr/local/hadoop/bin/hadoop fs -put /home/input/tolstoy-war-and-peace.txt /input
+```
+- Press CTRL+D to go back to the node.
+
+13. Submit the Flink Job to the cluster (On k8s Node)
+
+```
+# Get Flink job manager pod
+flinkjobmanager=$(kubectl get pods | grep flink-jobmanager | awk '{print $1}')
+
+# If target jar is not already on the pod, copy it to the Flink job manager pod in order to submit it via CLI
+kubectl cp WordCount.jar "${flinkjobmanager}":/examples/streaming/WordCount.jar
+
+# Connect inside the Flink job manager pod using bash to execute the commands afterwards
+kubectl exec -it "$flinkjobmanager" bash
+
+# Submit the job to the Flink cluster and provide the HDFS input and HDFS output paths for the program (to be executed on the Flink job manager pod $flinkjobmanager)
+./bin/flink run ./examples/streaming/WordCount.jar --input hdfs://hadoop-hadoop-hdfs-nn:9000/input/tolstoy-war-and-peace.txt --output hdfs://hadoop-hadoop-hdfs-nn:9000/output/output.txt
+
+# After the job is done, it should give an output like this;
+
+Job with JobID f4c856d57dd49a6b166bc911efaacd1f has finished.
+Job Runtime: 6830 ms
+
+
+# To check the outout, run; (as the default `WordCount.jar` creates two output files)
+
+/usr/local/hadoop/bin/hadoop fs -cat /output/output.txt/1
+/usr/local/hadoop/bin/hadoop fs -cat /output/output.txt/1
+
+# `/usr/local/hadoop/bin/hadoop fs` can be used to inspect the outputs. To make sure a new run would produce a new file, you may wanna delete it via that command with it's deletion flag.
+```
